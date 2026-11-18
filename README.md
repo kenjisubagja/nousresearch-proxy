@@ -1,356 +1,148 @@
 ## Nousresearch-proxy
 Free model from nousresearch : QWEN4-MAX
 
-## Penjelasan
+# nous-proxy
 
-Gateway lokal yang bikin langganan/akun **Nous Portal** (inference-api.nousresearch.com)
-bisa dipakai dari tool apa pun yang bicara OpenAI-compatible API — Hermes,
-OpenClaw, Claude Code (lewat penerjemah), Codex CLI, 9router, bahkan script
-Python biasa. Satu endpoint lokal (`http://127.0.0.1:8899/v1`), credential
-diurus otomatis.
+Proxy lokal buat pakai akun Nous Portal dari tool apa pun. Satu endpoint
+OpenAI-compatible di 127.0.0.1:8899, credential diurus otomatis, bisa banyak
+akun sekaligus dengan round-robin. Kena rate limit atau satu akun mati,
+request pindah ke akun berikutnya.
 
-## Kegunaan
+## Yang perlu ada
 
-- **Pakai akun Nous dari mana saja** tanpa copy-paste API key. Proxy menumpang
-  credential Hermes yang sudah login, atau file auth hasil `nous_login.py`.
-- **Pool banyak akun sekaligus**: taruh auth1.json, auth2.json, ... di folder
-  `auths/`, request dilempar **round-robin** bergiliran. Rate limit kena di
-  satu akun? Request otomatis failover ke akun lain. Cocok buat nyebarin
-  beban kerja berat lintas akun yang lu punya.
-- **Token nggak pernah expired di tengah jalan**: refresh lewat jalur RESMI
-  Hermes (fungsi yang sama dengan runtime-nya), jadi aman dari
-  `refresh_token_reused` — refresh token Nous itu single-use, refresh liar
-  dari script luar bisa mencabut seluruh sesi. Di sini nggak ada refresh liar.
-- **Streaming SSE, /v1/models, chat completions** semua diteruskan transparan.
+- Python 3.10+ (stdlib saja, nggak butuh pip)
+- Hermes Agent yang sudah login Nous: `hermes auth add nous`
+  (install Hermes: `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`)
+- Akun Nous Portal. Free tier cukup buat model `:free`
 
-Cara kerja singkat:
+Nggak ada install buat nous-proxy sendiri: salin folder ini ke mesin
+tujuan, folder auths/ dibuat otomatis pas pertama run.
 
-```
-client (Hermes/OpenClaw/Claude/dll)
-   -> http://127.0.0.1:8899/v1  (nous_proxy.py, round-robin)
-      -> auths/auth1.json / auth2.json / ... (atau credential Hermes live)
-         -> https://inference-api.nousresearch.com/v1
-```
+## Jalanin
 
-## Isi folder
+    python3 ~/nous-proxy/nous_proxy.py
 
-```
-nous-proxy/
-  nous_proxy.py    proxy utama (pool round-robin + failover + refresh resmi)
-  nous_login.py    login akun Nous ala Hermes -> simpan ke auths/<nama>.json
-  auths/           taruh file credential di sini (auth1.json, auth2.json, ...)
-  auths/.state/    sandbox refresh per file (dibuat otomatis, jangan diedit)
-  nous_proxy.log   log request (tanpa token)
-  README.md        file ini
-```
+Arahkan client ke:
 
-## Prasyarat (yang harus terinstall)
+    base_url  http://127.0.0.1:8899/v1
+    api_key   bebas
+    model     qwen/qwen4-max:free (id lain: curl /v1/models)
 
-Urutan install dari nol:
+Tes cepat: `curl -s http://127.0.0.1:8899/health`
 
-1. **Python 3.10+** — cek: `python3 --version`.
-   Belum ada? Debian/Kali/Ubuntu: `sudo apt install python3`
-   macOS: `brew install python3`
-   Script ini stdlib-only, TIDAK butuh pip install apa pun.
+Kalau auths/ kosong, proxy pakai credential Hermes yang live. Kalau ada
+file di auths/, file-file itu yang jadi pool.
 
-2. **Hermes Agent** — cek: `hermes --version`.
-   Belum ada? Install resmi:
+## Tambah akun
 
-   ```bash
-   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-   ```
+    python3 ~/nous-proxy/nous_login.py          # auth1.json, auth2.json, ...
+    python3 ~/nous-proxy/nous_login.py akunB    # nama bebas
 
-   Docs: https://hermes-agent.nousresearch.com/docs
-   Dipakai untuk jalur login resmi + auto-refresh token.
+Dia kasih URL, lu login di browser, file tersimpan sendiri di auths/.
+Restart proxy setelah nambah file. Pastikan browser login sebagai akun
+yang berbeda tiap file. Jangan taruh login yang sama di dua file: refresh
+token Nous single-use, chain dobel bikin sesi dicabut.
 
-3. **Login Nous di Hermes** (sekali saja):
+## Nyambungin ke agent dan 9router
 
-   ```bash
-   hermes auth add nous        # ikuti URL device-code, login di browser
-   hermes auth status nous     # cek sudah login
-   ```
+Hermes:
 
-   Akun: daftar di https://portal.nousresearch.com — free tier cukup untuk
-   model `:free` (mis. `qwen/qwen4-max:free`); model lain butuh
-   subscription/credits.
-   (Tanpa Hermes proxy tetap bisa jalan mode readonly `NO_REFRESH=1`, tapi
-   token mati setelah ~1 jam dan tidak diperpanjang — tidak disarankan.)
+    hermes config set providers.nous-proxy.api http://127.0.0.1:8899/v1
+    hermes config set providers.nous-proxy.transport chat_completions
 
-4. **curl** — buat tes cepat; biasanya sudah ada (`sudo apt install curl`).
+lalu di dalam CLI: `/model custom:nous-proxy:qwen/qwen4-max:free --global`
 
-5. Opsional, sesuai client yang mau disambungkan:
-   - **OpenClaw** — docs: https://docs.openclaw.ai
-   - **Claude Code + claude-code-router** — butuh Node.js
-     (https://nodejs.org atau `sudo apt install nodejs npm`), lalu:
-     `npm install -g @anthropic-ai/claude-code @musistudio/claude-code-router`
-   - **9router** — https://github.com/decolua/9router (kalau mau lewat router)
-   - **Codex CLI** — `npm install -g @openai/codex`
+OpenClaw, di ~/.openclaw/openclaw.json:
 
-**Install nous-proxy sendiri: tidak ada.** Cukup salin folder ini
-(`nous_proxy.py` + `nous_login.py` + `README.md`) ke mesin tujuan, mis.
-`~/nous-proxy/`. Folder `auths/` dibuat otomatis saat pertama run.
-
-Sudah diuji di Kali Linux (Python 3.14). macOS harusnya jalan selama Hermes
-terinstall; Windows belum diuji.
-
-## Quick start
-
-```bash
-# 1. Jalankan proxy (biarkan hidup; pakai tmux/screen kalau mau ditinggal)
-python3 ~/nous-proxy/nous_proxy.py            # port 8899
-# atau: tmux new -d -s nousproxy 'python3 ~/nous-proxy/nous_proxy.py'
-
-# 2. Tes
-curl -s http://127.0.0.1:8899/health
-curl -s http://127.0.0.1:8899/v1/models -H 'Authorization: Bearer bebas' | head
-curl -s http://127.0.0.1:8899/v1/chat/completions \
-  -H 'Authorization: Bearer bebas' -H 'Content-Type: application/json' \
-  -d '{"model":"qwen/qwen4-max:free","messages":[{"role":"user","content":"halo"}],"max_tokens":200}'
-```
-
-Kalau `auths/` kosong, proxy otomatis pakai credential Hermes yang live
-(`~/.hermes/auth.json`) lewat jalur resmi in-process. Begitu ada file di
-`auths/`, file-file itu yang jadi pool (tambah `INCLUDE_MAIN=1` kalau mau
-credential live ikut jadi anggota).
-
-## Tambah akun (multi-auth round-robin)
-
-### Cara gampang: login lewat script
-
-```bash
-python3 ~/nous-proxy/nous_login.py            # -> auths/auth1.json
-python3 ~/nous-proxy/nous_login.py            # lagi -> auths/auth2.json (akun beda!)
-python3 ~/nous-proxy/nous_login.py akunC      # -> auths/akunC.json
-```
-
-Script kasih URL → lu login/approve di browser → credential otomatis tersimpan
-dengan bentuk auth store Hermes lengkap (siap di-refresh resmi oleh proxy).
-Jalur login = fungsi resmi Hermes in-process (`_nous_device_code_login`),
-fallback stdlib dengan protokol device-code RFC 8628 yang sama.
-Tidak menyentuh `~/.hermes/auth.json`.
-
-Penting: akun yang ke-approve mengikuti sesi browser lu di portal. Buat akun
-kedua, sign-in dulu sebagai akun itu di browser (atau pakai incognito/profile
-browser lain). Akun yang emailnya sama dengan file existing diblok default
-(`--force` kalau memang mau login ulang akun itu — chain-nya terpisah, aman).
-
-### Atau salin manual
-
-Login di Hermes/profile lain (`hermes --profile akunB auth add nous`), lalu
-salin `~/.hermes/profiles/akunB/auth.json` ke `auths/auth2.json`. Bisa juga
-salin `~/.hermes/auth.json` dari mesin lain.
-
-### Perilaku pool
-
-- Request dilempar bergiliran (round-robin) ke tiap auth.
-- Auth yang 401 (setelah retry) atau 429 di-cooldown (120s / 60s atau
-  Retry-After), request di-failover ke auth berikutnya.
-- Token expired di-refresh lewat jalur RESMI: `hermes auth refresh nous`
-  di sandbox HERMES_HOME per file (`auths/.state/<nama>/`), rotation dipersist
-  dan disinkronkan balik ke file-nya.
-- **Restart proxy setelah menambah/menghapus file auth** (pool discan saat startup).
-
-```
-!! JANGAN taruh salinan login akun yang SAMA di dua file. Refresh token Nous
-!! single-use: dua store yang me-refresh chain yang sama akan saling
-!! membatalkan (refresh_token_reused -> sesi dicabut, login ulang).
-!! Satu file = satu akun berbeda. (Login ulang via nous_login.py aman —
-!! itu membuat chain baru, bukan menyalin chain lama.)
-```
-
-## Nyambungin ke 9router
-
-Semua client mengarah ke endpoint yang sama:
-
-```
-Base URL : http://127.0.0.1:8899/v1
-API key  : bebas (proxy yang pasang credential asli; atau set LOCAL_KEY
-           di proxy dan samakan key-nya di client biar nggak sembarang
-           proses lokal bisa pakai)
-Model    : id dari /v1/models, mis. qwen/qwen4-max:free
-```
-
-### Hermes Agent
-
-Daftarkan proxy sebagai custom provider (perintah resmi, jangan edit
-config.yaml manual):
-
-```bash
-hermes config set providers.nous-proxy.api http://127.0.0.1:8899/v1
-hermes config set providers.nous-proxy.transport chat_completions
-```
-
-Lalu di dalam CLI Hermes:
-
-```
-/model custom:nous-proxy:qwen/qwen4-max:free --global
-```
-
-(`--global` = jadi default permanen; tanpa itu hanya sesi ini.)
-Alternatif: `hermes model` → wizard **Custom Endpoint** → isi base URL,
-key bebas, model id. Katalog model diambil otomatis dari `/v1/models` proxy.
-
-Catatan: kalau pool masih kosong (mode live), Hermes → proxy → credential
-Hermes yang sama — muter doang, nggak manfaat. Manfaatnya muncul kalau
-`auths/` sudah berisi beberapa akun: Hermes ikut kena round-robin pool.
-
-### OpenClaw
-
-Edit `~/.openclaw/openclaw.json` (JSON5; gateway hot-reload otomatis):
-
-```json5
-{
-  agents: { defaults: { model: { primary: "nous-proxy/qwen/qwen4-max:free" } } },
-  models: {
-    mode: "merge",
-    providers: {
-      "nous-proxy": {
-        baseUrl: "http://127.0.0.1:8899/v1",
-        apiKey: "***",          // loopback + key kosong = no-auth, boleh dihapus
-        api: "openai-completions",
-        models: [
-          { id: "qwen/qwen4-max:free", name: "Qwen4 Max (Nous pool)" }
-        ]
-      }
-    }
-  }
-}
-```
-
-Referensi model: `<provider-id>/<model-id>`. Tambah entri di `models[]`
-untuk model lain yang mau dipakai. Docs resmi:
-https://docs.openclaw.ai/gateway/config-tools/custom-providers
-
-### Claude Code
-
-Claude Code bicara format **Anthropic**, sedangkan proxy ini format
-**OpenAI** — jadi butuh penerjemah di tengah. Pilih salah satu:
-
-**Opsi A — claude-code-router (paling umum):**
-
-```bash
-npm install -g @anthropic-ai/claude-code @musistudio/claude-code-router
-```
-
-Buat `~/.claude-code-router/config.json`:
-
-```json
-{
-  "Providers": [
     {
-      "name": "nous",
-      "api_base_url": "http://127.0.0.1:8899/v1/chat/completions",
-      "api_key": "***",
-      "models": ["qwen/qwen4-max:free"],
-      "transformer": { "use": ["OpenAI"] }
+      agents: { defaults: { model: { primary: "nous-proxy/qwen/qwen4-max:free" } } },
+      models: { providers: { "nous-proxy": {
+        baseUrl: "http://127.0.0.1:8899/v1",
+        api: "openai-completions",
+        models: [{ id: "qwen/qwen4-max:free", name: "Nous pool" }]
+      } } }
     }
-  ],
-  "Router": {
-    "default": "nous,qwen/qwen4-max:free"
-  }
-}
-```
 
-Jalankan Claude Code lewat router: `ccr code`.
-(`api_base_url` harus penuh sampai `/chat/completions`.)
+Claude Code bicara format Anthropic, jadi butuh penerjemah. Paling gampang
+claude-code-router:
 
-**Opsi B — lewat 9router (sudah terinstall di mesin ini):**
-9router menerjemahkan Anthropic ↔ OpenAI. Di dashboard 9router
-(http://localhost:20128/dashboard) → Providers → tambah custom
-OpenAI-compatible endpoint: base URL `http://127.0.0.1:8899/v1`, key bebas,
-model `qwen/qwen4-max:free`. Lalu arahkan Claude Code ke endpoint 9router
-seperti biasa (lihat docs 9router bagian Claude Code).
+    npm install -g @anthropic-ai/claude-code @musistudio/claude-code-router
 
-**Opsi C — LiteLLM proxy:** jalankan LiteLLM dengan backend OpenAI-compatible
-ke `http://127.0.0.1:8899/v1`, lalu set `ANTHROPIC_BASE_URL` Claude Code ke
-LiteLLM. Lebih berat; pakai A atau B dulu.
+~/.claude-code-router/config.json:
 
-### Codex CLI
+    {
+      "Providers": [{
+        "name": "nous",
+        "api_base_url": "http://127.0.0.1:8899/v1/chat/completions",
+        "api_key": "***",
+        "models": ["qwen/qwen4-max:free"],
+        "transformer": { "use": ["OpenAI"] }
+      }],
+      "Router": { "default": "nous,qwen/qwen4-max:free" }
+    }
 
-`~/.codex/config.toml`:
+Jalankan dengan `ccr code`.
 
-```toml
-model = "qwen/qwen4-max:free"
-model_provider = "nouspool"
+9router (di mesin ini sudah jalan di port 20128): buka
+http://localhost:20128/dashboard, login, masuk ke Providers, tambah custom
+endpoint OpenAI-compatible:
 
-[model_providers.nouspool]
-name = "Nous Pool"
-base_url = "http://127.0.0.1:8899/v1"
-wire_api = "chat"
-env_key = "NOUS_PROXY_KEY"
-```
+    name/prefix  nous
+    baseUrl      http://127.0.0.1:8899/v1
+    apiType      chat
+    apiKey       bebas
 
-```bash
-export NOUS_PROXY_KEY=bebas
-codex
-```
+Modelnya nanti dipanggil `nous/<model-id>`, misal
+`nous/qwen/qwen4-max:free`. Client lu tetap mengarah ke 9router
+(http://localhost:20128/v1 + key dari dashboard); 9router yang meneruskan
+ke proxy ini. Claude Code juga bisa lewat 9router karena dia
+menerjemahkan Anthropic ke OpenAI.
 
-### 9router / client OpenAI-compatible lain
+Codex, di ~/.codex/config.toml:
 
-Tambah custom provider/OpenAI-compatible endpoint di tool masing-masing:
-base URL `http://127.0.0.1:8899/v1`, API key bebas, model id dari `/v1/models`.
+    model = "qwen/qwen4-max:free"
+    model_provider = "nouspool"
 
-## Endpoint lokal proxy
+    [model_providers.nouspool]
+    base_url = "http://127.0.0.1:8899/v1"
+    wire_api = "chat"
+    env_key = "NOUS_PROXY_KEY"
 
-```
-/health        status + daftar member (backend, expiry token)
-/stats         req/ok/gagal per member, cooldown, pointer round-robin
-/v1/models     katalog model dari Nous (diteruskan, pakai auth member)
-/v1/chat/completions, /v1/completions, /v1/embeddings  (diteruskan)
-```
+Export `NOUS_PROXY_KEY=bebas` sebelum menjalankan codex.
 
-## Env proxy
+## Umur token
 
-```
-PORT=8899            port listen (atau argumen pertama)
-UPSTREAM             default https://inference-api.nousresearch.com
-AUTH_DIR             folder file auth (default <folder script>/auths)
-INCLUDE_MAIN=1       sertakan credential Hermes live sebagai anggota pool
-BACKEND_MODE         auto (default) | inprocess | cli | readonly (member live)
-NO_REFRESH=1         semua member readonly, tanpa refresh
-LOCAL_KEY=<key>      client wajib pakai bearer ini
-FORCE_REFRESH=1      paksa refresh member live saat startup (buat tes)
-STRIP_RESPONSES=1    strip state /responses ala codex_strip_proxy (default OFF)
-DUMP_DIR=<path>      simpan body request (hati-hati: isi percakapan)
-COOLDOWN_429=60      detik cooldown saat rate limit (hormati Retry-After)
-COOLDOWN_401=120     detik cooldown saat auth gagal
-LOG=<path>           default ~/nous-proxy/nous_proxy.log
-HERMES_REPO          lokasi source hermes-agent (default ~/.hermes/hermes-agent)
-```
+Access token umurnya sekitar satu jam, lalu di-refresh otomatis. Nggak
+dipake beberapa jam atau beberapa hari tetap aman: pas dipakai lagi dia
+refresh sendiri, nggak perlu login ulang. Selama proxy jalan, keepalive
+me-refresh sebelum token mati walau nggak ada request (matikan dengan
+KEEPALIVE=0).
 
-## Keamanan & catatan penting
+Batas kerasnya: grant login mati 30 hari setelah approval, dan refresh
+tidak memperpanjangnya. Ini kebijakan Portal, dikonfirmasi di
+https://github.com/NousResearch/hermes-agent/issues/117461 — Hermes yang
+jalan 24/7 pun logout di hari ke-30. Sisa umur per akun bisa dicek:
 
-- Proxy bind **hanya 127.0.0.1** — tidak terbuka ke jaringan.
-- File auth berisi credential: folder `auths/` di-set 700, file 600.
-  Jangan commit/share folder ini. Token tidak pernah ditulis ke log.
-- Tanpa `LOCAL_KEY`, proses lokal apa pun bisa pakai proxy. Set `LOCAL_KEY`
-  kalau mesin dipakai bersama.
-- Refresh token Nous **single-use**: hanya jalur resmi yang boleh refresh
-  (proxy ini sudah pakai itu). Jangan bikin script lain yang POST ke
-  `/api/oauth/token` pakai token dari file-file ini.
-- Satu file = satu akun berbeda. Jangan duplikat chain yang sama.
-- Pool multi-akun = akun-akun milik lu sendiri. Jangan pakai credential
-  orang lain.
+    curl -s http://127.0.0.1:8899/stats
 
-## Troubleshooting
+`grant_days_left` itu hitung mundurnya; log ngasih warning kalau sisa 5
+hari. Login ulang sebelum habis:
 
-- **401 dari proxy** → token member expired dan refresh gagal. Cek
-  `/stats`; login ulang akun itu (`nous_login.py --force` atau
-  `hermes auth refresh nous` untuk member live).
-- **503 "semua member gagal"** → semua auth kena cooldown/error. Cek
-  `nous_proxy.log` dan `/stats`; biasanya subscription habis atau semua
-  token mati.
-- **429 terus di satu akun** → normal, itu rate limit; pool akan oper ke
-  akun lain. Kalau semua akun kena, kurangi laju request.
-- **Model tidak ditemukan** → cek id persis di `/v1/models` (case-sensitive,
-  termasuk suffix `:free`).
-- **Habis tambah file auth tapi nggak kepakai** → restart proxy (pool
-  discan saat startup).
-- **`nous_login.py` gagal import Hermes** → otomatis fallback stdlib;
-  pastikan `HERMES_REPO` benar kalau instalasi Hermes di lokasi lain.
+    python3 ~/nous-proxy/nous_login.py --force authN
 
-Alternatif bawaan Hermes untuk single-auth (tanpa pool):
-`hermes proxy start --provider nous --port 8645`.
+Kalau grant satu akun mati, pool tetap jalan pakai akun yang lain.
 
-Alternatif bawaan Hermes untuk single-auth (tanpa pool):
-`hermes proxy start --provider nous --port 8645`.
+## Keamanan
+
+Proxy cuma listen di 127.0.0.1. File auth permission 600, folder 700,
+token nggak pernah ditulis ke log. Refresh selalu lewat jalur resmi
+Hermes, jadi nggak ada refresh liar yang memicu refresh_token_reused.
+Kalau mesin dipakai rame-rame, set LOCAL_KEY=<key> dan client wajib pakai
+key itu. Jangan share folder auths/ ke mana-mana.
+
+## Env lain
+
+PORT, UPSTREAM, AUTH_DIR, INCLUDE_MAIN=1 (ikutkan credential live ke
+pool), BACKEND_MODE=auto|inprocess|cli|readonly, NO_REFRESH=1,
+COOLDOWN_429=60, COOLDOWN_401=120, STRIP_RESPONSES=1, DUMP_DIR, LOG.
+
