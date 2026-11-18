@@ -1,0 +1,23 @@
+2026-11-19 05:53:25 [hermes-live] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:14 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:20 [auth2] bearer gagal: token expired (2020-01-01T01:00:00+00:00) dan refresh gagal
+2026-11-19 05:54:20 [auth2] cooldown 5s (http=401)
+2026-11-19 05:54:20 [auth2] POST /v1/chat/completions gagal http=401 -> failover
+2026-11-19 05:54:22 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:28 [auth2] bearer gagal: token expired (2020-01-01T01:00:00+00:00) dan refresh gagal
+2026-11-19 05:54:28 [auth2] cooldown 5s (http=401)
+2026-11-19 05:54:28 [auth2] POST /v1/chat/completions gagal http=401 -> failover
+2026-11-19 05:54:29 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:35 [auth2] bearer gagal: token expired (2020-01-01T01:00:00+00:00) dan refresh gagal
+2026-11-19 05:54:35 [auth2] cooldown 5s (http=401)
+2026-11-19 05:54:35 [auth2] POST /v1/chat/completions gagal http=401 -> failover
+2026-11-19 05:54:37 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:43 [auth2] bearer gagal: token expired (2020-01-01T01:00:00+00:00) dan refresh gagal
+2026-11-19 05:54:43 [auth2] cooldown 5s (http=401)
+2026-11-19 05:54:43 [auth2] POST /v1/chat/completions gagal http=401 -> failover
+2026-11-19 05:54:46 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:54:52 [auth2] bearer gagal: token expired (2020-01-01T01:00:00+00:00) dan refresh gagal
+2026-11-19 05:54:52 [auth2] cooldown 5s (http=401)
+2026-11-19 05:54:52 [auth2] POST /v1/chat/completions gagal http=401 -> failover
+2026-11-19 05:54:53 [auth1] POST /v1/chat/completions http=200 stripped=0 req=112B
+2026-11-19 05:55:50 [hermes-live] POST /v1/chat/completions http=200 stripped=0 req=112B
