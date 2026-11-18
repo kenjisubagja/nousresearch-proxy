@@ -1,324 +1,628 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""nous_login.py — login Nous Portal persis seperti Hermes, hasil ke auths/
-
-Jalankan script ini, dia kasih URL, lu login/approve di browser, credential
-disimpan otomatis sebagai auths/authN.json (atau nama pilihan lu) — siap
-dipakai nous_proxy.py (round-robin multi-auth).
-
-  python3 nous_login.py              -> auths/auth1.json, auth2.json, ... (urut)
-  python3 nous_login.py akunB        -> auths/akunB.json
-  python3 nous_login.py --no-browser -> jangan buka browser otomatis
-  python3 nous_login.py --force      -> izinkan akun yang sama dengan file existing
-
-Jalur login SAMA PERSIS dengan `hermes auth add nous`:
-  1. POST {portal}/api/oauth/device/code  (client_id=hermes-cli, scope=inference:invoke)
-  2. tampilin verification_uri_complete + user_code, buka browser
-  3. polling POST {portal}/api/oauth/token (grant_type device-code RFC 8628):
-     authorization_pending -> tunggu; slow_down -> interval+1; 408/429/5xx/
-     edge-mitigated -> backoff hormati Retry-After; deadline = expires_in
-  4. finalisasi invoke-JWT/agent_key lewat fungsi resmi Hermes
-     (refresh_nous_oauth_from_state — tidak menyentuh auth.json asli)
-
-Prioritas: fungsi resmi _nous_device_code_login() di-import in-process dari
-instalasi hermes-agent. Kalau import gagal, fallback implementasi stdlib
-dengan protokol yang sama.
-
-File hasil berbentuk auth store Hermes lengkap (providers.nous +
-credential_pool.nous entri device_code), jadi refresh resmi via
-`hermes auth refresh nous` di sandbox nous_proxy.py langsung jalan.
-
-Script ini TIDAK PERNAH menulis ke ~/.hermes/auth.json atau shared store.
-Satu login = satu chain refresh baru. Akun yang sama boleh login lagi
-(chain terpisah, seperti device berbeda), tapi defaultnya diblok supaya
-tidak sengaja dobel — pakai --force kalau memang mau.
-
-Env: HERMES_REPO (default ~/.hermes/hermes-agent), AUTH_DIR
-     (default <folder script>/auths), HERMES_PORTAL_BASE_URL /
-     NOUS_PORTAL_BASE_URL (override portal, sama seperti Hermes).
-"""
-import argparse
 import base64
+import http.server
 import json
 import os
-import re
+import shutil
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
-import uuid
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get('PORT', '8899'))
+UP = (sys.argv[2] if len(sys.argv) > 2 else
+      os.environ.get('UPSTREAM', 'https://inference-api.nousresearch.com')).rstrip('/')
+HERMES_HOME = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes'))).expanduser()
 HERMES_REPO = os.environ.get('HERMES_REPO', str(Path.home() / '.hermes' / 'hermes-agent'))
-PORTAL = (os.environ.get('HERMES_PORTAL_BASE_URL') or
-          os.environ.get('NOUS_PORTAL_BASE_URL') or
-          'https://portal.nousresearch.com').rstrip('/')
-INFERENCE = 'https://inference-api.nousresearch.com/v1'
-CLIENT_ID = 'hermes-cli'
-SCOPE = 'inference:invoke'
-GRANT_DEVICE = 'urn:ietf:params:oauth:grant-type:device_code'
-POLL_CAP = 1          # Hermes: DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1
-EMPTY_AGENT_KEYS = {'agent_key': None, 'agent_key_id': None,
-                    'agent_key_expires_at': None, 'agent_key_expires_in': None,
-                    'agent_key_reused': None, 'agent_key_obtained_at': None}
+AUTH_DIR = Path(os.environ.get('AUTH_DIR', str(SCRIPT_DIR / 'auths'))).expanduser()
+LOG = os.environ.get('LOG', str(SCRIPT_DIR / 'nous_proxy.log'))
+DUMP = os.environ.get('DUMP_DIR')
+LOCAL_KEY = os.environ.get('LOCAL_KEY', '').strip()
+NO_REFRESH = os.environ.get('NO_REFRESH') == '1'
+STRIP = os.environ.get('STRIP_RESPONSES') == '1'
+INCLUDE_MAIN = os.environ.get('INCLUDE_MAIN') == '1'
+BACKEND_MODE = 'readonly' if NO_REFRESH else os.environ.get('BACKEND_MODE', 'auto').strip().lower()
+COOLDOWN_429 = int(os.environ.get('COOLDOWN_429', '60'))
+COOLDOWN_401 = int(os.environ.get('COOLDOWN_401', '120'))
+KEEPALIVE = os.environ.get('KEEPALIVE', '1') != '0'
+KEEPALIVE_HORIZON = int(os.environ.get('KEEPALIVE_HORIZON', '0'))
+SKEW = 120
+REFRESH_COOLDOWN = 20
+SKIP_HDRS = {'host', 'content-length', 'connection', 'transfer-encoding',
+             'accept-encoding', 'authorization'}
+
+_pool_lock = threading.Lock()
+_rr = [0]
+N = [0]
 
 
 def _now():
     return datetime.now(timezone.utc)
 
 
-def _iso_after(now, ttl):
-    return datetime.fromtimestamp(now.timestamp() + int(ttl), tz=timezone.utc).isoformat()
-
-
-def _jwt_claims(token):
+def _parse_iso(s):
+    if not s:
+        return None
     try:
-        seg = str(token).split('.')[1]
-        return json.loads(base64.urlsafe_b64decode(seg + '=' * (-len(seg) % 4)))
+        dt = datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
-        return {}
+        return None
 
 
-def label_from_token(token, fallback='nous-account'):
-    claims = _jwt_claims(token)
-    for key in ('email', 'preferred_username', 'upn'):
-        val = claims.get(key)
-        if val:
-            return str(val)
-    return fallback
-
-
-def _post_form(url, fields, timeout=30):
-    data = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(url, data=data, method='POST')
-    req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-    req.add_header('Accept', 'application/json')
+def _jwt_iat(token):
     try:
-        r = urllib.request.urlopen(req, timeout=timeout)
-        return r.status, dict(r.headers), json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:
-            payload = json.loads(e.read())
-        except Exception:
-            payload = {}
-        return e.code, dict(e.headers), payload
+        seg = token.split('.')[1]
+        payload = json.loads(base64.urlsafe_b64decode(seg + '=' * (-len(seg) % 4)))
+        return float(payload.get('iat') or 0)
+    except Exception:
+        return 0.0
 
 
-def _login_stdlib(open_browser=True):
-    """Fallback: device-code flow RFC 8628, protokol sama dengan Hermes."""
-    code, _, dev = _post_form(PORTAL + '/api/oauth/device/code',
-                              {'client_id': CLIENT_ID, 'scope': SCOPE})
-    if code != 200 or 'device_code' not in dev:
-        raise SystemExit('Device code request gagal (http=%s): %s' %
-                         (code, json.dumps(dev)[:200]))
-    url = dev['verification_uri_complete']
-    print()
-    print('To continue:')
-    print('  1. Open: %s' % url)
-    print('  2. If prompted, enter code: %s' % dev['user_code'])
-    if open_browser:
-        try:
-            if webbrowser.open(url):
-                print('  (Opened browser for verification)')
-        except Exception:
-            pass
-    interval = max(1, min(int(dev['interval']), POLL_CAP))
-    deadline = time.monotonic() + max(1, int(dev['expires_in']))
-    print('Waiting for approval (polling every %ss)...' % interval, flush=True)
-    edge_backoff = 0.0
-    while time.monotonic() < deadline:
-        code, hdrs, payload = _post_form(
-            PORTAL + '/api/oauth/token',
-            {'grant_type': GRANT_DEVICE, 'client_id': CLIENT_ID,
-             'device_code': dev['device_code']})
-        if code == 200 and payload.get('access_token'):
-            now = _now()
-            ttl = int(payload.get('expires_in') or 3600)
-            state = {
-                'portal_base_url': PORTAL,
-                'inference_base_url': payload.get('inference_base_url') or INFERENCE,
-                'client_id': CLIENT_ID,
-                'scope': payload.get('scope') or SCOPE,
-                'token_type': payload.get('token_type') or 'Bearer',
-                'access_token': payload['access_token'],
-                'refresh_token': payload.get('refresh_token'),
-                'obtained_at': now.isoformat(),
-                'expires_at': _iso_after(now, ttl),
-                'expires_in': ttl,
-                'tls': {'insecure': False, 'ca_bundle': None},
-                **EMPTY_AGENT_KEYS}
-            return state
-        err = str(payload.get('error') or '')
-        if err == 'authorization_pending':
-            edge_backoff = 0.0
-            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
-            continue
-        if err == 'slow_down':
-            interval = min(interval + 1, 30)
-            time.sleep(interval)
-            continue
-        if code in (408, 429) or code >= 500 or (code == 403 and hdrs.get('x-vercel-mitigated')):
-            try:
-                ra = int(hdrs.get('Retry-After', ''))
-                edge_backoff = min(max(interval, ra), 60)
-            except Exception:
-                edge_backoff = min(max(edge_backoff * 2, interval * 2, 5), 60)
-            time.sleep(max(0.0, min(edge_backoff, deadline - time.monotonic())))
-            continue
-        raise SystemExit('Login gagal: %s — %s' %
-                         (err or ('http %s' % code),
-                          payload.get('error_description') or json.dumps(payload)[:200]))
-    raise SystemExit('Device code expired sebelum di-approve. Ulangi login; '
-                     'pastikan sudah sign-in di %s/login' % PORTAL)
+def _epoch(dt):
+    return dt.timestamp() if dt else 0.0
 
 
-def login_official(open_browser=True):
-    """Jalur utama: fungsi login resmi Hermes, in-process, tanpa persist ke
-    auth.json asli (docstring resminya: 'return full OAuth state without persisting')."""
-    if HERMES_REPO not in sys.path:
-        sys.path.insert(0, HERMES_REPO)
-    from hermes_cli.auth_nous import _nous_device_code_login
-    return _nous_device_code_login(open_browser=open_browser)
+def _valid(exp):
+    return bool(exp) and _now().timestamp() + SKEW < exp.timestamp()
 
 
-def build_store(state, label=None):
-    """Bentuk auth store Hermes: singleton providers.nous + entri pool device_code."""
-    state = dict(state)
-    lbl = label or str(state.get('label') or '').strip() or \
-        label_from_token(state.get('access_token', ''))
-    state.setdefault('label', lbl)
-    entry = {
-        'id': uuid.uuid4().hex[:6],
-        'label': lbl,
-        'auth_type': 'oauth',
-        'priority': 0,
-        'source': 'device_code',
-        'access_token': state.get('access_token'),
-        'refresh_token': state.get('refresh_token'),
-        'last_status': 'ok',
-        'last_status_at': None,
-        'last_error_code': None,
-        'last_error_reason': None,
-        'last_error_message': None,
-        'last_error_reset_at': None,
-        'expires_at': state.get('expires_at'),
-        'inference_base_url': state.get('inference_base_url'),
-        'agent_key': state.get('agent_key'),
-        'agent_key_expires_at': state.get('agent_key_expires_at'),
-        'request_count': 0,
-        'token_type': state.get('token_type'),
-        'scope': state.get('scope'),
-        'client_id': state.get('client_id'),
-        'portal_base_url': state.get('portal_base_url'),
-        'obtained_at': state.get('obtained_at'),
-        'expires_in': state.get('expires_in'),
-        'agent_key_id': state.get('agent_key_id'),
-        'agent_key_expires_in': state.get('agent_key_expires_in'),
-        'agent_key_reused': state.get('agent_key_reused'),
-        'agent_key_obtained_at': state.get('agent_key_obtained_at'),
-        'tls': state.get('tls'),
-    }
-    return {'version': 1, 'providers': {'nous': state},
-            'active_provider': 'nous', 'credential_pool': {'nous': [entry]}}
+def _log(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, 'a') as fh:
+            fh.write('%s %s\n' % (time.strftime('%F %T'), line))
+    except Exception:
+        pass
 
 
-def existing_accounts(auth_dir):
-    """email -> nama file, dari semua auth store yang sudah ada."""
-    out = {}
-    for p in sorted(auth_dir.glob('*.json')):
-        try:
-            store = json.loads(p.read_text())
-            st = (store.get('providers') or {}).get('nous') or {}
-            tok = st.get('agent_key') or st.get('access_token') or ''
-            email = _jwt_claims(tok).get('email')
-            if email:
-                out[str(email)] = p.name
-        except Exception:
-            continue
+def _states_from_store(store):
+    out = []
+    if isinstance(store, dict):
+        prov = (store.get('providers') or {}).get('nous')
+        if isinstance(prov, dict):
+            out.append(prov)
+        for entry in (store.get('credential_pool') or {}).get('nous') or []:
+            if isinstance(entry, dict):
+                out.append(entry)
+        if not out and (store.get('access_token') or store.get('agent_key')):
+            out.append(store)
     return out
 
 
-def next_name(auth_dir):
-    nums = []
-    for p in auth_dir.glob('auth*.json'):
-        m = re.fullmatch(r'auth(\d+)', p.stem)
-        if m:
-            nums.append(int(m.group(1)))
-    return 'auth%d' % (max(nums) + 1 if nums else 1)
+def _freshest_in(states):
+    best = None
+    for state in states:
+        tok = state.get('agent_key') or state.get('access_token')
+        if not tok or not isinstance(tok, str):
+            continue
+        exp = _parse_iso(state.get('agent_key_expires_at') or state.get('expires_at'))
+        obtained = _parse_iso(state.get('obtained_at'))
+        order = (_jwt_iat(tok) or _epoch(obtained), _epoch(exp))
+        if best is None or order > best['order']:
+            best = {'token': tok, 'exp': exp, 'order': order,
+                    'pool_id': state.get('id')}
+    return best
 
 
-def verify_inference(state):
-    tok = state.get('agent_key') or state.get('access_token')
-    base = str(state.get('inference_base_url') or INFERENCE).rstrip('/')
-    req = urllib.request.Request(base + '/models')
-    req.add_header('Authorization', 'Bearer ' + tok)
+def _read_file_member(path):
     try:
-        r = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(r.read())
-        return len(data.get('data', []))
-    except Exception as e:
-        return 'gagal: %s' % type(e).__name__
+        store = json.loads(path.read_text())
+    except Exception:
+        return None, None
+    return _freshest_in(_states_from_store(store)), store
 
 
-def main():
-    ap = argparse.ArgumentParser(description='Login Nous Portal ala Hermes -> auths/<nama>.json')
-    ap.add_argument('name', nargs='?', help='nama file tanpa .json (default: authN urut)')
-    ap.add_argument('--auth-dir', default=os.environ.get('AUTH_DIR', str(SCRIPT_DIR / 'auths')))
-    ap.add_argument('--force', action='store_true', help='izinkan akun yang sudah ada')
-    ap.add_argument('--no-browser', action='store_true', help='jangan buka browser otomatis')
-    args = ap.parse_args()
-
-    auth_dir = Path(args.auth_dir).expanduser()
-    auth_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(auth_dir, 0o700)
-    name = re.sub(r'[^A-Za-z0-9_-]', '', args.name) if args.name else next_name(auth_dir)
-    if not name:
-        raise SystemExit('Nama file tidak valid.')
-    target = auth_dir / (name + '.json')
-    if target.exists() and not args.force:
-        raise SystemExit('%s sudah ada. Pakai nama lain atau --force.' % target)
-
-    print('Login Nous Portal (jalur resmi Hermes device-code)')
-    print('Portal: %s' % PORTAL)
+_resolve_official = None
+_import_err = None
+if BACKEND_MODE in ('auto', 'inprocess'):
     try:
-        state = login_official(open_browser=not args.no_browser)
-        print('(selesai via fungsi resmi Hermes in-process)')
-    except SystemExit:
-        raise
-    except Exception as e:
-        print('Jalur resmi tidak tersedia (%s: %s) — fallback stdlib.' %
-              (type(e).__name__, e))
-        state = _login_stdlib(open_browser=not args.no_browser)
+        if HERMES_REPO not in sys.path:
+            sys.path.insert(0, HERMES_REPO)
+        from hermes_cli.auth import resolve_nous_runtime_credentials
+        try:
+            from hermes_cli.anon_challenge import background_caller
+        except Exception:
+            import contextlib
 
-    label = label_from_token(state.get('access_token', ''))
-    accounts = existing_accounts(auth_dir)
-    if label in accounts and not args.force:
-        raise SystemExit(
-            'Akun %s sudah ada di %s. Login ulang akun yang sama membuat chain '
-            'terpisah (boleh, seperti device baru), tapi default diblok biar '
-            'tidak dobel. Ulangi dengan --force kalau memang mau.' %
-            (label, accounts[label]))
+            @contextlib.contextmanager
+            def background_caller():
+                yield
 
-    store = build_store(state, label)
-    tmp = target.with_suffix('.tmp')
-    tmp.write_text(json.dumps(store, indent=2))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
+        def _resolve_official(force=False, stale=None):
+            kw = {'force_refresh': force, 'stale_access_token': stale,
+                  'timeout_seconds': 30}
+            with background_caller():
+                return resolve_nous_runtime_credentials(**kw)
+    except Exception as _e:
+        _import_err = '%s: %s' % (type(_e).__name__, _e)
+        _resolve_official = None
 
-    print()
-    print('Login berhasil!')
-    print('  Akun   : %s' % label)
-    print('  File   : %s' % target)
-    print('  Expires: %s' % state.get('expires_at'))
-    n = verify_inference(state)
-    print('  Cek /v1/models: %s model' % n if isinstance(n, int) else '  Cek /v1/models: %s' % n)
-    print()
-    print('Restart nous_proxy.py biar file baru ke-load jadi member pool.')
+if BACKEND_MODE == 'inprocess' and _resolve_official is None:
+    raise SystemExit('BACKEND_MODE=inprocess tapi import gagal: %s' % _import_err)
+if _resolve_official is not None:
+    LIVE_BACKEND = 'official-inprocess'
+elif BACKEND_MODE in ('auto', 'cli') and (shutil.which('hermes') or
+                                          Path.home().joinpath('.local/bin/hermes').exists()):
+    LIVE_BACKEND = 'cli'
+else:
+    LIVE_BACKEND = 'readonly'
+
+
+def _hermes_bin():
+    return shutil.which('hermes') or str(Path.home() / '.local' / 'bin' / 'hermes')
+
+
+class Member:
+    def __init__(self, name, kind, path=None):
+        self.name = name
+        self.kind = kind
+        self.path = path
+        self.lock = threading.Lock()
+        self.cache = {'token': None, 'exp': None}
+        self.cooldown_until = 0.0
+        self.last_refresh = 0.0
+        self.last_grant_warn = 0.0
+        self.file_mtime = 0.0
+        self.stats = {'req': 0, 'ok': 0, 'fail': 0, 'last_status': None}
+
+    def _live_bearer(self, force, stale):
+        if LIVE_BACKEND == 'official-inprocess':
+            cred = _resolve_official(force=force, stale=stale)
+            tok = cred.get('api_key')
+            if not tok:
+                raise RuntimeError('resolver resmi tidak mengembalikan api_key')
+            return tok, _parse_iso(cred.get('expires_at'))
+        best, _ = _read_file_member(HERMES_HOME / 'auth.json')
+        if best and _valid(best['exp']):
+            return best['token'], best['exp']
+        if LIVE_BACKEND == 'cli' and self._cli_refresh(HERMES_HOME / 'auth.json', None):
+            best, _ = _read_file_member(HERMES_HOME / 'auth.json')
+            if best and _valid(best['exp']):
+                return best['token'], best['exp']
+        raise RuntimeError('credential Hermes live expired dan refresh gagal '
+                           '(backend=%s); jalankan: hermes auth refresh nous' % LIVE_BACKEND)
+
+    def _cli_refresh(self, source_path, pool_id):
+        if NO_REFRESH:
+            return False
+        if time.monotonic() - self.last_refresh < REFRESH_COOLDOWN:
+            return False
+        self.last_refresh = time.monotonic()
+        if self.kind == 'live':
+            env = dict(os.environ)
+            cmd = [_hermes_bin(), 'auth', 'refresh', 'nous']
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=90, env=env)
+                _log('[%s] refresh cli exit=%d' % (self.name, r.returncode))
+                return r.returncode == 0
+            except Exception as e:
+                _log('[%s] refresh cli gagal: %s' % (self.name, type(e).__name__))
+                return False
+        sb = AUTH_DIR / '.state' / self.name
+        try:
+            (sb / 'shared').mkdir(parents=True, exist_ok=True)
+            store = json.loads(source_path.read_text())
+            if not isinstance(store, dict) or 'providers' not in store:
+                state = store if isinstance(store, dict) else {}
+                store = {'version': 1, 'providers': {'nous': state},
+                         'active_provider': 'nous'}
+            (sb / 'auth.json').write_text(json.dumps(store))
+            env = dict(os.environ)
+            env['HERMES_HOME'] = str(sb)
+            env['HERMES_SHARED_AUTH_DIR'] = str(sb / 'shared')
+            cmd = [_hermes_bin(), 'auth', 'refresh', 'nous']
+            r = subprocess.run(cmd, capture_output=True, timeout=90, env=env)
+            if r.returncode != 0 and b'pass an index' in (r.stdout + r.stderr) and pool_id:
+                cmd = [_hermes_bin(), 'auth', 'refresh', 'nous', str(pool_id)]
+                r = subprocess.run(cmd, capture_output=True, timeout=90, env=env)
+            _log('[%s] refresh sandbox exit=%d' % (self.name, r.returncode))
+            if r.returncode != 0:
+                return False
+            new = (sb / 'auth.json').read_bytes()
+            tmp = source_path.with_suffix('.tmp')
+            tmp.write_bytes(new)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, source_path)
+            return True
+        except Exception as e:
+            _log('[%s] refresh sandbox gagal: %s' % (self.name, type(e).__name__))
+            return False
+
+    def bearer(self, force=False, stale=None):
+        with self.lock:
+            if self.kind == 'live':
+                if not force and self.cache['token'] and _valid(self.cache['exp']):
+                    return self.cache['token']
+                tok, exp = self._live_bearer(force, stale)
+                self.cache.update(token=tok, exp=exp)
+                return tok
+            try:
+                mtime = self.path.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            if mtime != self.file_mtime:
+                self.file_mtime = mtime
+                self.cache.update(token=None, exp=None)
+            if not force and self.cache['token'] and _valid(self.cache['exp']):
+                return self.cache['token']
+            best, _ = _read_file_member(self.path)
+            if best and _valid(best['exp']):
+                self.cache.update(token=best['token'], exp=best['exp'])
+                return best['token']
+            if self._cli_refresh(self.path, best['pool_id'] if best else None):
+                best, _ = _read_file_member(self.path)
+                if best and _valid(best['exp']):
+                    self.file_mtime = self.path.stat().st_mtime
+                    self.cache.update(token=best['token'], exp=best['exp'])
+                    return best['token']
+            exp_str = best['exp'].isoformat() if best and best['exp'] else 'tidak ada'
+            raise RuntimeError('token expired (%s) dan refresh gagal' % exp_str)
+
+    def refresh_now(self):
+        with self.lock:
+            if self.kind == 'live' and LIVE_BACKEND == 'official-inprocess':
+                cred = _resolve_official(force=True, stale=None)
+                tok = cred.get('api_key')
+                if not tok:
+                    raise RuntimeError('resolver resmi tidak mengembalikan api_key')
+                exp = _parse_iso(cred.get('expires_at'))
+                self.cache.update(token=tok, exp=exp)
+                return exp
+            path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+            best, _ = _read_file_member(path)
+            if not self._cli_refresh(path, best['pool_id'] if best else None):
+                raise RuntimeError('refresh resmi gagal')
+            best, _ = _read_file_member(path)
+            if not best:
+                raise RuntimeError('tidak ada token setelah refresh')
+            if self.kind == 'file':
+                self.file_mtime = path.stat().st_mtime
+            self.cache.update(token=best['token'], exp=best['exp'])
+            return best['exp']
+
+    def lifetime(self):
+        path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+        try:
+            store = json.loads(path.read_text())
+            st = (store.get('providers') or {}).get('nous') or {}
+            vals = [int(float(st[k])) for k in ('expires_in', 'agent_key_expires_in')
+                    if st.get(k)]
+            return min(v for v in vals if v > 0) if vals else 3600
+        except Exception:
+            return 3600
+
+    def info(self):
+        exp = self.cache['exp']
+        if self.kind == 'file' and not exp:
+            best, _ = _read_file_member(self.path)
+            exp = best['exp'] if best else None
+        grant = None
+        days_left = None
+        try:
+            path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+            store = json.loads(path.read_text())
+            g = ((store.get('providers') or {}).get('nous') or {}).get('grant_approved_at')
+            gd = _parse_iso(g)
+            if gd:
+                grant = gd.isoformat()
+                days_left = round(30.0 - (_now().timestamp() - gd.timestamp()) / 86400.0, 2)
+        except Exception:
+            pass
+        return {
+            'name': self.name, 'kind': self.kind,
+            'backend': LIVE_BACKEND if self.kind == 'live' else 'file+cli-sandbox',
+            'req': self.stats['req'], 'ok': self.stats['ok'], 'fail': self.stats['fail'],
+            'last_status': self.stats['last_status'],
+            'cooldown_s': max(0, round(self.cooldown_until - time.monotonic())),
+            'token_expires_at': exp.isoformat() if exp else None,
+            'grant_approved_at': grant,
+            'grant_days_left': days_left,
+        }
+
+
+def build_pool():
+    members = []
+    try:
+        AUTH_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(AUTH_DIR, 0o700)
+        state_dir = AUTH_DIR / '.state'
+        state_dir.mkdir(exist_ok=True)
+        os.chmod(state_dir, 0o700)
+    except Exception:
+        pass
+    for p in sorted(AUTH_DIR.glob('*.json')):
+        members.append(Member(p.stem, 'file', p))
+    if not members or INCLUDE_MAIN:
+        members.append(Member('hermes-live', 'live'))
+    return members
+
+
+MEMBERS = build_pool()
+
+
+def pick_member(exclude=()):
+    with _pool_lock:
+        n = len(MEMBERS)
+        for _ in range(n):
+            m = MEMBERS[_rr[0] % n]
+            _rr[0] += 1
+            if m.name in exclude:
+                continue
+            if time.monotonic() >= m.cooldown_until:
+                return m
+        cands = [m for m in MEMBERS if m.name not in exclude]
+        if not cands:
+            return None
+        return min(cands, key=lambda m: m.cooldown_until)
+
+
+def sanitize(body, path):
+    stripped = 0
+    if not STRIP or '/responses' not in path:
+        return body, stripped
+    try:
+        j = json.loads(body)
+    except Exception:
+        return body, stripped
+    if not isinstance(j, dict):
+        return body, stripped
+    if 'previous_response_id' in j:
+        j.pop('previous_response_id', None)
+        stripped += 1
+    inp = j.get('input')
+    if isinstance(inp, list):
+        for it in inp:
+            if isinstance(it, dict):
+                if 'id' in it:
+                    it.pop('id')
+                    stripped += 1
+                for k in [k for k in it if k.startswith('encrypted')]:
+                    it.pop(k)
+                    stripped += 1
+    return json.dumps(j, ensure_ascii=False).encode(), stripped
+
+
+def _upstream_url(path):
+    if UP.endswith('/v1') and path.startswith('/v1/'):
+        return UP[:-3] + path
+    return UP + path
+
+
+def _client_ok(headers):
+    if not LOCAL_KEY:
+        return True
+    return headers.get('Authorization', '') == 'Bearer ' + LOCAL_KEY
+
+
+def _cooldown(m, code, rinfo):
+    if code == 429:
+        wait = COOLDOWN_429
+        try:
+            ra = int(rinfo.get('Retry-After', ''))
+            wait = max(wait, min(ra, 3600))
+        except Exception:
+            pass
+    else:
+        wait = COOLDOWN_401
+    m.cooldown_until = time.monotonic() + wait
+    _log('[%s] cooldown %ds (http=%s)' % (m.name, wait, code))
+
+
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *a):
+        pass
+
+    def _send_json(self, code, obj):
+        raw = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        p = self.path.split('?')[0]
+        if p in ('/health', '/v1/health'):
+            return self._send_json(200, {
+                'status': 'ok', 'upstream': UP,
+                'members': [m.info() for m in MEMBERS],
+                'strip_responses': STRIP, 'no_refresh': NO_REFRESH})
+        if p in ('/stats', '/v1/stats'):
+            return self._send_json(200, {'members': [m.info() for m in MEMBERS],
+                                         'rr_pointer': _rr[0]})
+        if not _client_ok(self.headers):
+            return self._send_json(401, {'error': {'message': 'local key salah'}})
+        m = pick_member()
+        if m is None:
+            return self._send_json(503, {'error': {'message': 'semua member cooldown'}})
+        try:
+            bearer = m.bearer()
+        except Exception as e:
+            m.stats['fail'] += 1
+            m.cooldown_until = time.monotonic() + COOLDOWN_401
+            return self._send_json(401, {'error': {'message': '[%s] %s' % (m.name, e)}})
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_HDRS}
+        hdrs['Authorization'] = 'Bearer ' + bearer
+        req = urllib.request.Request(_upstream_url(self.path), headers=hdrs, method='GET')
+        try:
+            r = urllib.request.urlopen(req, timeout=60)
+            code, raw, ct = r.status, r.read(), r.headers.get('Content-Type') or 'application/json'
+        except urllib.error.HTTPError as e:
+            code, raw, ct = e.code, e.read(), e.headers.get('Content-Type') or 'application/json'
+        except Exception as e:
+            code, raw, ct = 599, str(e).encode(), 'text/plain'
+        m.stats['req'] += 1
+        m.stats['last_status'] = code
+        if 200 <= code < 300:
+            m.stats['ok'] += 1
+        else:
+            m.stats['fail'] += 1
+        _log('[%s] GET %s http=%s resp=%dB' % (m.name, self.path, code, len(raw)))
+        self.send_response(code)
+        self.send_header('Content-Type', ct)
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self):
+        if not _client_ok(self.headers):
+            return self._send_json(401, {'error': {'message': 'local key salah'}})
+        ln = int(self.headers.get('Content-Length') or 0)
+        raw = self.rfile.read(ln)
+        body, stripped = sanitize(raw, self.path)
+        N[0] += 1
+        if DUMP:
+            try:
+                os.makedirs(DUMP, exist_ok=True)
+                open(os.path.join(DUMP, 'req_%03d.json' % N[0]), 'wb').write(body)
+            except Exception:
+                pass
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_HDRS}
+
+        tried = set()
+        code = rinfo = stream = None
+        for _ in range(len(MEMBERS) + 1):
+            m = pick_member(exclude=tried)
+            if m is None:
+                break
+            tried.add(m.name)
+            m.stats['req'] += 1
+            bearer = None
+            for attempt in (1, 2):
+                try:
+                    bearer = m.bearer(force=(attempt == 2), stale=bearer)
+                except Exception as e:
+                    _log('[%s] bearer gagal: %s' % (m.name, e))
+                    code = 401
+                    break
+                hdrs['Authorization'] = 'Bearer ' + bearer
+                req = urllib.request.Request(_upstream_url(self.path), data=body,
+                                             headers=hdrs, method='POST')
+                try:
+                    r = urllib.request.urlopen(req, timeout=600)
+                    code, rinfo, stream = r.status, r.headers, r
+                except urllib.error.HTTPError as e:
+                    code, rinfo, stream = e.code, e.headers, e
+                except Exception as e:
+                    code = 599
+                    _log('[%s] upstream gagal: %s' % (m.name, type(e).__name__))
+                    break
+                if code == 401 and attempt == 1:
+                    try:
+                        stream.read()
+                    except Exception:
+                        pass
+                    _log('[%s] 401 -> retry jalur resmi' % m.name)
+                    continue
+                break
+            m.stats['last_status'] = code
+            if code is not None and 200 <= code < 300:
+                m.stats['ok'] += 1
+                m.cooldown_until = 0.0
+                _log('[%s] POST %s http=%s stripped=%d req=%dB' %
+                     (m.name, self.path, code, stripped, len(raw)))
+                break
+            m.stats['fail'] += 1
+            if code in (401, 429):
+                _cooldown(m, code, rinfo)
+            if stream is not None:
+                try:
+                    stream.read()
+                except Exception:
+                    pass
+                stream = None
+            _log('[%s] POST %s gagal http=%s -> failover' % (m.name, self.path, code))
+
+        if stream is None:
+            return self._send_json(503 if code in (401, 429, None) else 599,
+                                   {'error': {'message': 'semua member gagal '
+                                              '(last http=%s)' % code}})
+        self.send_response(code)
+        self.send_header('Content-Type', rinfo.get('Content-Type') or 'application/json')
+        self.send_header('Transfer-Encoding', 'chunked')
+        self.end_headers()
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(('%x\r\n' % len(chunk)).encode() + chunk + b'\r\n')
+                self.wfile.flush()
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except Exception:
+            pass
+
+
+def _keepalive_loop():
+    while True:
+        time.sleep(30)
+        if NO_REFRESH:
+            return
+        for m in MEMBERS:
+            if time.monotonic() < m.cooldown_until:
+                continue
+            if m.kind == 'live' and LIVE_BACKEND == 'readonly':
+                continue
+            try:
+                exp = m.cache['exp']
+                if exp is None:
+                    if m.kind == 'file':
+                        best, _ = _read_file_member(m.path)
+                        exp = best['exp'] if best else None
+                    else:
+                        best, _ = _read_file_member(HERMES_HOME / 'auth.json')
+                        exp = best['exp'] if best else None
+                tick = max(60, min(900, m.lifetime() // 4))
+                horizon = KEEPALIVE_HORIZON if KEEPALIVE_HORIZON > 0 else tick + SKEW
+                if exp is None or exp.timestamp() - _now().timestamp() < horizon:
+                    m.refresh_now()
+                    _log('[%s] keepalive refresh OK' % m.name)
+            except Exception as e:
+                _log('[%s] keepalive gagal: %s' % (m.name, e))
+                m.cooldown_until = time.monotonic() + COOLDOWN_401
+            try:
+                left = m.info().get('grant_days_left')
+                if left is not None and left <= 5 and \
+                        time.monotonic() - m.last_grant_warn > 21600:
+                    m.last_grant_warn = time.monotonic()
+                    _log('[%s] WARNING: grant device-code mati dalam %.1f hari '
+                         '(hard limit 30 hari dari approval, refresh TIDAK '
+                         'memperpanjang). Login ulang: nous_login.py --force %s'
+                         % (m.name, left, m.name))
+            except Exception:
+                pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 if __name__ == '__main__':
-    main()
+    if os.environ.get('FORCE_REFRESH') == '1':
+        for m in MEMBERS:
+            if m.kind == 'live':
+                try:
+                    m.bearer(force=True)
+                    _log('[%s] force refresh OK' % m.name)
+                except Exception as e:
+                    _log('[%s] force refresh gagal: %s' % (m.name, e))
+    if KEEPALIVE and not NO_REFRESH:
+        threading.Thread(target=_keepalive_loop, daemon=True,
+                         name='nous-proxy-keepalive').start()
+    print('nous proxy: 127.0.0.1:%d -> %s' % (PORT, UP), flush=True)
+    print('members: %s' % ', '.join('%s(%s)' % (m.name, m.kind) for m in MEMBERS), flush=True)
+    print('keepalive: %s | log: %s' % ('on' if KEEPALIVE and not NO_REFRESH else 'off', LOG), flush=True)
+    Server(('127.0.0.1', PORT), H).serve_forever()
