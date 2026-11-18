@@ -1,64 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""nous_proxy.py — proxy lokal OpenAI-compatible -> Nous Portal, pool multi-auth
-
-Satu endpoint lokal, banyak credential. Taruh file auth.json dari akun-akun
-Nous yang berbeda di folder auths/ (auth1.json, auth2.json, ...):
-
-  nous-proxy/
-    nous_proxy.py
-    auths/
-      auth1.json   <- salinan ~/.hermes/auth.json dari akun A
-      auth2.json   <- salinan ~/.hermes/auth.json dari akun B
-      ...
-
-Request dilempar ROUND-ROBIN bergiliran ke tiap auth. Kalau satu auth gagal
-(401 setelah retry, 429, atau refresh gagal), auth itu di-cooldown sebentar
-dan request di-failover ke auth berikutnya.Kalau auths/ kosong, proxy pakai
-credential Hermes yang live (~/.hermes/auth.json) lewat jalur resmi in-process.
-
-AUTH RESMI, ANTI refresh_token_reused:
-  Refresh token Nous SINGLE-USE (rotating). Proxy ini tidak pernah POST ke
-  endpoint token sendiri:
-  - member "hermes-live": resolve_nous_runtime_credentials() in-process —
-    fungsi resmi runtime Hermes (lock + persist rotation + adopt token peer).
-  - member file: `hermes auth refresh nous` di sandbox HERMES_HOME per file
-    (auths/.state/<nama>/), dengan HERMES_SHARED_AUTH_DIR terisolasi, lalu
-    hasil rotation disinkronkan balik ke file auth-nya. Chain tiap akun
-    terpisah, tidak saling tabrak.
-
-  !! PENTING: tiap file harus akun BERBEDA. Jangan menaruh salinan login yang
-  !! sama di dua file — dua proses me-refresh satu chain single-use akan
-  !! memicu refresh_token_reused dan mencabut sesi akun itu.
-
-Usage:
-  python3 nous_proxy.py [port=8899] [upstream=https://inference-api.nousresearch.com]
-  Client (9router / Codex / dll):
-      base_url = "http://127.0.0.1:8899/v1"
-      api_key  = apa saja (atau samakan dengan LOCAL_KEY)
-  Model: id dari /v1/models, mis. "qwen/qwen4-max:free".
-
-Endpoint lokal:
-  /health  status ringkas + daftar member
-  /stats   statistik per member (req/ok/gagal, cooldown, expiry token)
-
-Env:
-  PORT / UPSTREAM
-  AUTH_DIR       folder file auth (default: <folder script>/auths)
-  INCLUDE_MAIN=1 sertakan juga credential Hermes live sebagai member
-  BACKEND_MODE   auto (default) | inprocess | cli | readonly  (member live)
-  NO_REFRESH=1   semua member readonly: tidak ada refresh sama sekali
-  HERMES_REPO    lokasi source hermes-agent (default ~/.hermes/hermes-agent)
-  LOCAL_KEY      kalau di-set, client wajib pakai bearer ini
-  FORCE_REFRESH=1  paksa refresh member live saat startup (buat tes)
-  STRIP_RESPONSES=1  strip state /responses ala codex_strip_proxy (default OFF)
-  DUMP_DIR       opsional: simpan body request (hati-hati: isi percakapan)
-  LOG            default <folder script>/nous_proxy.log
-  COOLDOWN_429   detik cooldown saat rate limit (default 60, hormati Retry-After)
-  COOLDOWN_401   detik cooldown saat auth gagal (default 120)
-
-Bind cuma 127.0.0.1. Token tidak pernah di-log.
-"""
 import base64
 import http.server
 import json
@@ -89,6 +29,8 @@ INCLUDE_MAIN = os.environ.get('INCLUDE_MAIN') == '1'
 BACKEND_MODE = 'readonly' if NO_REFRESH else os.environ.get('BACKEND_MODE', 'auto').strip().lower()
 COOLDOWN_429 = int(os.environ.get('COOLDOWN_429', '60'))
 COOLDOWN_401 = int(os.environ.get('COOLDOWN_401', '120'))
+KEEPALIVE = os.environ.get('KEEPALIVE', '1') != '0'
+KEEPALIVE_HORIZON = int(os.environ.get('KEEPALIVE_HORIZON', '0'))
 SKEW = 120
 REFRESH_COOLDOWN = 20
 SKIP_HDRS = {'host', 'content-length', 'connection', 'transfer-encoding',
@@ -140,7 +82,6 @@ def _log(line):
 
 
 def _states_from_store(store):
-    """Semua salinan state Nous dalam sebuah auth store (provider + pool)."""
     out = []
     if isinstance(store, dict):
         prov = (store.get('providers') or {}).get('nous')
@@ -149,7 +90,6 @@ def _states_from_store(store):
         for entry in (store.get('credential_pool') or {}).get('nous') or []:
             if isinstance(entry, dict):
                 out.append(entry)
-        # bentuk flat (shared store nous_auth.json) juga diterima
         if not out and (store.get('access_token') or store.get('agent_key')):
             out.append(store)
     return out
@@ -178,7 +118,6 @@ def _read_file_member(path):
     return _freshest_in(_states_from_store(store)), store
 
 
-# --- jalur resmi in-process (member live) ---
 _resolve_official = None
 _import_err = None
 if BACKEND_MODE in ('auto', 'inprocess'):
@@ -196,8 +135,6 @@ if BACKEND_MODE in ('auto', 'inprocess'):
                 yield
 
         def _resolve_official(force=False, stale=None):
-            # kwargs via dict + ** unpack: menghindari pola kwarg berbau
-            # credential yang bisa dirusak layer secret-redaction saat ditulis.
             kw = {'force_refresh': force, 'stale_access_token': stale,
                   'timeout_seconds': 30}
             with background_caller():
@@ -224,16 +161,16 @@ def _hermes_bin():
 class Member:
     def __init__(self, name, kind, path=None):
         self.name = name
-        self.kind = kind            # 'file' | 'live'
+        self.kind = kind
         self.path = path
         self.lock = threading.Lock()
         self.cache = {'token': None, 'exp': None}
         self.cooldown_until = 0.0
         self.last_refresh = 0.0
+        self.last_grant_warn = 0.0
         self.file_mtime = 0.0
         self.stats = {'req': 0, 'ok': 0, 'fail': 0, 'last_status': None}
 
-    # -- token --
     def _live_bearer(self, force, stale):
         if LIVE_BACKEND == 'official-inprocess':
             cred = _resolve_official(force=force, stale=stale)
@@ -252,8 +189,6 @@ class Member:
                            '(backend=%s); jalankan: hermes auth refresh nous' % LIVE_BACKEND)
 
     def _cli_refresh(self, source_path, pool_id):
-        """Refresh resmi via CLI. Untuk member file: sandbox HERMES_HOME per
-        file supaya lock/rotation/shared-store tiap akun terisolasi."""
         if NO_REFRESH:
             return False
         if time.monotonic() - self.last_refresh < REFRESH_COOLDOWN:
@@ -269,7 +204,6 @@ class Member:
             except Exception as e:
                 _log('[%s] refresh cli gagal: %s' % (self.name, type(e).__name__))
                 return False
-        # member file: salin ke sandbox, refresh di sana, sync balik
         sb = AUTH_DIR / '.state' / self.name
         try:
             (sb / 'shared').mkdir(parents=True, exist_ok=True)
@@ -290,10 +224,10 @@ class Member:
             _log('[%s] refresh sandbox exit=%d' % (self.name, r.returncode))
             if r.returncode != 0:
                 return False
-            # sync rotation balik ke file sumber (atomik)
             new = (sb / 'auth.json').read_bytes()
             tmp = source_path.with_suffix('.tmp')
             tmp.write_bytes(new)
+            os.chmod(tmp, 0o600)
             os.replace(tmp, source_path)
             return True
         except Exception as e:
@@ -308,7 +242,6 @@ class Member:
                 tok, exp = self._live_bearer(force, stale)
                 self.cache.update(token=tok, exp=exp)
                 return tok
-            # member file
             try:
                 mtime = self.path.stat().st_mtime
             except Exception:
@@ -331,11 +264,56 @@ class Member:
             exp_str = best['exp'].isoformat() if best and best['exp'] else 'tidak ada'
             raise RuntimeError('token expired (%s) dan refresh gagal' % exp_str)
 
+    def refresh_now(self):
+        with self.lock:
+            if self.kind == 'live' and LIVE_BACKEND == 'official-inprocess':
+                cred = _resolve_official(force=True, stale=None)
+                tok = cred.get('api_key')
+                if not tok:
+                    raise RuntimeError('resolver resmi tidak mengembalikan api_key')
+                exp = _parse_iso(cred.get('expires_at'))
+                self.cache.update(token=tok, exp=exp)
+                return exp
+            path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+            best, _ = _read_file_member(path)
+            if not self._cli_refresh(path, best['pool_id'] if best else None):
+                raise RuntimeError('refresh resmi gagal')
+            best, _ = _read_file_member(path)
+            if not best:
+                raise RuntimeError('tidak ada token setelah refresh')
+            if self.kind == 'file':
+                self.file_mtime = path.stat().st_mtime
+            self.cache.update(token=best['token'], exp=best['exp'])
+            return best['exp']
+
+    def lifetime(self):
+        path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+        try:
+            store = json.loads(path.read_text())
+            st = (store.get('providers') or {}).get('nous') or {}
+            vals = [int(float(st[k])) for k in ('expires_in', 'agent_key_expires_in')
+                    if st.get(k)]
+            return min(v for v in vals if v > 0) if vals else 3600
+        except Exception:
+            return 3600
+
     def info(self):
         exp = self.cache['exp']
         if self.kind == 'file' and not exp:
             best, _ = _read_file_member(self.path)
             exp = best['exp'] if best else None
+        grant = None
+        days_left = None
+        try:
+            path = HERMES_HOME / 'auth.json' if self.kind == 'live' else self.path
+            store = json.loads(path.read_text())
+            g = ((store.get('providers') or {}).get('nous') or {}).get('grant_approved_at')
+            gd = _parse_iso(g)
+            if gd:
+                grant = gd.isoformat()
+                days_left = round(30.0 - (_now().timestamp() - gd.timestamp()) / 86400.0, 2)
+        except Exception:
+            pass
         return {
             'name': self.name, 'kind': self.kind,
             'backend': LIVE_BACKEND if self.kind == 'live' else 'file+cli-sandbox',
@@ -343,6 +321,8 @@ class Member:
             'last_status': self.stats['last_status'],
             'cooldown_s': max(0, round(self.cooldown_until - time.monotonic())),
             'token_expires_at': exp.isoformat() if exp else None,
+            'grant_approved_at': grant,
+            'grant_days_left': days_left,
         }
 
 
@@ -376,7 +356,6 @@ def pick_member(exclude=()):
                 continue
             if time.monotonic() >= m.cooldown_until:
                 return m
-        # semua cooldown: pilih yang paling cepat pulih, kalau ada yang bukan exclude
         cands = [m for m in MEMBERS if m.name not in exclude]
         if not cands:
             return None
@@ -583,6 +562,54 @@ class H(http.server.BaseHTTPRequestHandler):
             pass
 
 
+def _keepalive_loop():
+    while True:
+        time.sleep(30)
+        if NO_REFRESH:
+            return
+        for m in MEMBERS:
+            if time.monotonic() < m.cooldown_until:
+                continue
+            if m.kind == 'live' and LIVE_BACKEND == 'readonly':
+                continue
+            try:
+                exp = m.cache['exp']
+                if exp is None:
+                    if m.kind == 'file':
+                        best, _ = _read_file_member(m.path)
+                        exp = best['exp'] if best else None
+                    else:
+                        best, _ = _read_file_member(HERMES_HOME / 'auth.json')
+                        exp = best['exp'] if best else None
+                tick = max(60, min(900, m.lifetime() // 4))
+                horizon = KEEPALIVE_HORIZON if KEEPALIVE_HORIZON > 0 else tick + SKEW
+                if exp is None or exp.timestamp() - _now().timestamp() < horizon:
+                    m.refresh_now()
+                    _log('[%s] keepalive refresh OK' % m.name)
+            except Exception as e:
+                _log('[%s] keepalive gagal: %s' % (m.name, e))
+                m.cooldown_until = time.monotonic() + COOLDOWN_401
+            try:
+                left = m.info().get('grant_days_left')
+                if left is not None and left <= 5 and \
+                        time.monotonic() - m.last_grant_warn > 21600:
+                    m.last_grant_warn = time.monotonic()
+                    _log('[%s] WARNING: grant device-code mati dalam %.1f hari '
+                         '(hard limit 30 hari dari approval, refresh TIDAK '
+                         'memperpanjang). Login ulang: nous_login.py --force %s'
+                         % (m.name, left, m.name))
+            except Exception:
+                pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == '__main__':
     if os.environ.get('FORCE_REFRESH') == '1':
         for m in MEMBERS:
@@ -592,7 +619,10 @@ if __name__ == '__main__':
                     _log('[%s] force refresh OK' % m.name)
                 except Exception as e:
                     _log('[%s] force refresh gagal: %s' % (m.name, e))
+    if KEEPALIVE and not NO_REFRESH:
+        threading.Thread(target=_keepalive_loop, daemon=True,
+                         name='nous-proxy-keepalive').start()
     print('nous proxy: 127.0.0.1:%d -> %s' % (PORT, UP), flush=True)
     print('members: %s' % ', '.join('%s(%s)' % (m.name, m.kind) for m in MEMBERS), flush=True)
-    print('log: %s' % LOG, flush=True)
-    http.server.ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
+    print('keepalive: %s | log: %s' % ('on' if KEEPALIVE and not NO_REFRESH else 'off', LOG), flush=True)
+    Server(('127.0.0.1', PORT), H).serve_forever()
