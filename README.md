@@ -158,7 +158,7 @@ salin `~/.hermes/auth.json` dari mesin lain.
 !! itu membuat chain baru, bukan menyalin chain lama.)
 ```
 
-## Nyambungin ke tools
+## Nyambungin ke 9router
 
 Semua client mengarah ke endpoint yang sama:
 
