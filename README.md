@@ -1,7 +1,7 @@
 ## Nousresearch-proxy
 Free model from nousresearch : QWEN4-MAX
 
-# nous-proxy
+# Nous-proxy
 
 Proxy lokal buat pakai akun Nous Portal dari tool apa pun. Satu endpoint
 OpenAI-compatible di 127.0.0.1:8899, credential diurus otomatis, bisa banyak
