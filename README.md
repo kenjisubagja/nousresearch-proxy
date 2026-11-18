@@ -3,7 +3,7 @@ Free model from nousresearch : QWEN4-MAX
 
 # nous-proxy
 
-## Ini apa?
+## Penjelasan
 
 Gateway lokal yang bikin langganan/akun **Nous Portal** (inference-api.nousresearch.com)
 bisa dipakai dari tool apa pun yang bicara OpenAI-compatible API — Hermes,
