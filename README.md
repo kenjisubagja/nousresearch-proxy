@@ -1,5 +1,7 @@
 ## Nousresearch-proxy
 Free model from nousresearch : QWEN4-MAX
+# nous-proxy
+
 ## Penjelasan
 
 Gateway lokal yang bikin langganan/akun **Nous Portal** (inference-api.nousresearch.com)
@@ -8,7 +10,7 @@ OpenClaw, Claude Code (lewat penerjemah), Codex CLI, 9router, bahkan script
 Python biasa. Satu endpoint lokal (`http://127.0.0.1:8899/v1`), credential
 diurus otomatis.
 
-## Cara Kerja
+## Kegunaan
 
 - **Pakai akun Nous dari mana saja** tanpa copy-paste API key. Proxy menumpang
   credential Hermes yang sudah login, atau file auth hasil `nous_login.py`.
@@ -31,7 +33,7 @@ client (Hermes/OpenClaw/Claude/dll)
          -> https://inference-api.nousresearch.com/v1
 ```
 
-## Struktur
+## Isi folder
 
 ```
 nous-proxy/
@@ -40,27 +42,54 @@ nous-proxy/
   auths/           taruh file credential di sini (auth1.json, auth2.json, ...)
   auths/.state/    sandbox refresh per file (dibuat otomatis, jangan diedit)
   nous_proxy.log   log request (tanpa token)
+  README.md        file ini
 ```
 
 ## Prasyarat (yang harus terinstall)
 
+Urutan install dari nol:
+
 1. **Python 3.10+** — cek: `python3 --version`.
+   Belum ada? Debian/Kali/Ubuntu: `sudo apt install python3`
+   macOS: `brew install python3`
    Script ini stdlib-only, TIDAK butuh pip install apa pun.
+
 2. **Hermes Agent** — cek: `hermes --version`.
-   Dipakai untuk jalur login resmi + auto-refresh token. Login Nous-nya harus
-   sudah ada: `hermes auth status nous`.
-   Install: https://hermes-agent.nousresearch.com/docs
+   Belum ada? Install resmi:
+
+   ```bash
+   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+   ```
+
+   Docs: https://hermes-agent.nousresearch.com/docs
+   Dipakai untuk jalur login resmi + auto-refresh token.
+
+3. **Login Nous di Hermes** (sekali saja):
+
+   ```bash
+   hermes auth add nous        # ikuti URL device-code, login di browser
+   hermes auth status nous     # cek sudah login
+   ```
+
+   Akun: daftar di https://portal.nousresearch.com — free tier cukup untuk
+   model `:free` (mis. `qwen/qwen4-max:free`); model lain butuh
+   subscription/credits.
    (Tanpa Hermes proxy tetap bisa jalan mode readonly `NO_REFRESH=1`, tapi
    token mati setelah ~1 jam dan tidak diperpanjang — tidak disarankan.)
-3. **Akun Nous Portal** — free tier cukup untuk model `:free`
-   (mis. `qwen/qwen4-max:free`); model lain butuh subscription/credits.
-   Login: https://portal.nousresearch.com
-4. **curl** (buat tes cepat; biasanya sudah ada).
+
+4. **curl** — buat tes cepat; biasanya sudah ada (`sudo apt install curl`).
+
 5. Opsional, sesuai client yang mau disambungkan:
-   - **OpenClaw** terinstall (docs: https://docs.openclaw.ai)
-   - **Claude Code** + **Node.js** + **claude-code-router** (lihat bagian Claude)
-   - **9router** (kalau mau lewat router yang sudah ada)
-   - **Codex CLI**
+   - **OpenClaw** — docs: https://docs.openclaw.ai
+   - **Claude Code + claude-code-router** — butuh Node.js
+     (https://nodejs.org atau `sudo apt install nodejs npm`), lalu:
+     `npm install -g @anthropic-ai/claude-code @musistudio/claude-code-router`
+   - **9router** — https://github.com/decolua/9router (kalau mau lewat router)
+   - **Codex CLI** — `npm install -g @openai/codex`
+
+**Install nous-proxy sendiri: tidak ada.** Cukup salin folder ini
+(`nous_proxy.py` + `nous_login.py` + `README.md`) ke mesin tujuan, mis.
+`~/nous-proxy/`. Folder `auths/` dibuat otomatis saat pertama run.
 
 Sudah diuji di Kali Linux (Python 3.14). macOS harusnya jalan selama Hermes
 terinstall; Windows belum diuji.
@@ -320,6 +349,9 @@ HERMES_REPO          lokasi source hermes-agent (default ~/.hermes/hermes-agent)
   discan saat startup).
 - **`nous_login.py` gagal import Hermes** → otomatis fallback stdlib;
   pastikan `HERMES_REPO` benar kalau instalasi Hermes di lokasi lain.
+
+Alternatif bawaan Hermes untuk single-auth (tanpa pool):
+`hermes proxy start --provider nous --port 8645`.
 
 Alternatif bawaan Hermes untuk single-auth (tanpa pool):
 `hermes proxy start --provider nous --port 8645`.
