@@ -11,7 +11,7 @@ OpenClaw, Claude Code (lewat penerjemah), Codex CLI, 9router, bahkan script
 Python biasa. Satu endpoint lokal (`http://127.0.0.1:8899/v1`), credential
 diurus otomatis.
 
-## Buat apa?
+## Cara Kerja
 
 - **Pakai akun Nous dari mana saja** tanpa copy-paste API key. Proxy menumpang
   credential Hermes yang sudah login, atau file auth hasil `nous_login.py`.
@@ -34,7 +34,7 @@ client (Hermes/OpenClaw/Claude/dll)
          -> https://inference-api.nousresearch.com/v1
 ```
 
-## Isi folder
+## Struktur
 
 ```
 nous-proxy/
@@ -43,7 +43,6 @@ nous-proxy/
   auths/           taruh file credential di sini (auth1.json, auth2.json, ...)
   auths/.state/    sandbox refresh per file (dibuat otomatis, jangan diedit)
   nous_proxy.log   log request (tanpa token)
-  README.md        file ini
 ```
 
 ## Prasyarat (yang harus terinstall)
