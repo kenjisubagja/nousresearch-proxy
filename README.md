@@ -1,8 +1,5 @@
 ## Nousresearch-proxy
 Free model from nousresearch : QWEN4-MAX
-
-# nous-proxy
-
 ## Penjelasan
 
 Gateway lokal yang bikin langganan/akun **Nous Portal** (inference-api.nousresearch.com)
