@@ -27,7 +27,7 @@ NO_REFRESH = os.environ.get('NO_REFRESH') == '1'
 STRIP = os.environ.get('STRIP_RESPONSES') == '1'
 INCLUDE_MAIN = os.environ.get('INCLUDE_MAIN') == '1'
 BACKEND_MODE = 'readonly' if NO_REFRESH else os.environ.get('BACKEND_MODE', 'auto').strip().lower()
-COOLDOWN_429 = int(os.environ.get('COOLDOWN_429', '60'))
+COOLDOWN_429 = int(os.environ.get('COOLDOWN_429', '20'))
 COOLDOWN_401 = int(os.environ.get('COOLDOWN_401', '120'))
 # Batasi failover saat 429: satu request tidak boleh membakar seluruh pool.
 MAX_429_FAILOVER = int(os.environ.get('MAX_429_FAILOVER', '2'))
@@ -77,13 +77,31 @@ def _valid(exp):
     return bool(exp) and _now().timestamp() + SKEW < exp.timestamp()
 
 
+_print_lock = threading.Lock()
+_stats_lock = threading.Lock()
+WRITE_LOG_FILE = os.environ.get('LOG_FILE') == '1'
+STATS = {'req': 0, 'ok': 0, 'r429': 0, 'err': 0}
+
+
 def _log(line):
-    try:
-        os.makedirs(os.path.dirname(LOG), exist_ok=True)
-        with open(LOG, 'a') as fh:
-            fh.write('%s %s\n' % (time.strftime('%F %T'), line))
-    except Exception:
-        pass
+    with _print_lock:
+        print('%s %s' % (time.strftime('%H:%M:%S'), line), flush=True)
+        if WRITE_LOG_FILE:
+            try:
+                os.makedirs(os.path.dirname(LOG), exist_ok=True)
+                with open(LOG, 'a') as fh:
+                    fh.write('%s %s\n' % (time.strftime('%F %T'), line))
+            except Exception:
+                pass
+
+
+def _tally(kind):
+    with _stats_lock:
+        STATS['req'] += 1
+        key = 'ok' if kind == 'ok' else 'r429' if kind == '429' else 'err'
+        STATS[key] += 1
+        return 'ok=%d 429=%d err=%d total=%d' % (
+            STATS['ok'], STATS['r429'], STATS['err'], STATS['req'])
 
 
 def _states_from_store(store):
@@ -204,7 +222,8 @@ class Member:
             cmd = [_hermes_bin(), 'auth', 'refresh', 'nous']
             try:
                 r = subprocess.run(cmd, capture_output=True, timeout=90, env=env)
-                _log('[%s] refresh cli exit=%d' % (self.name, r.returncode))
+                if r.returncode != 0:
+                    _log('[%s] refresh cli exit=%d' % (self.name, r.returncode))
                 return r.returncode == 0
             except Exception as e:
                 _log('[%s] refresh cli gagal: %s' % (self.name, type(e).__name__))
@@ -226,8 +245,8 @@ class Member:
             if r.returncode != 0 and b'pass an index' in (r.stdout + r.stderr) and pool_id:
                 cmd = [_hermes_bin(), 'auth', 'refresh', 'nous', str(pool_id)]
                 r = subprocess.run(cmd, capture_output=True, timeout=90, env=env)
-            _log('[%s] refresh sandbox exit=%d' % (self.name, r.returncode))
             if r.returncode != 0:
+                _log('[%s] refresh sandbox exit=%d' % (self.name, r.returncode))
                 return False
             new = (sb / 'auth.json').read_bytes()
             tmp = source_path.with_suffix('.tmp')
@@ -545,8 +564,8 @@ class H(http.server.BaseHTTPRequestHandler):
             if code is not None and 200 <= code < 300:
                 m.stats['ok'] += 1
                 m.cooldown_until = 0.0
-                _log('[%s] POST %s http=%s stripped=%d req=%dB' %
-                     (m.name, self.path, code, stripped, len(raw)))
+                _log('✓ %s [%s] %dB | %s' %
+                     (code, m.name, len(raw), _tally('ok')))
                 break
             m.stats['fail'] += 1
             preview = ''
@@ -563,10 +582,18 @@ class H(http.server.BaseHTTPRequestHandler):
             if code in (401, 429):
                 _cooldown(m, code, rinfo, preview)
             if code in (401, 429, 503):
-                rl = {k: v for k, v in (rinfo.items() if rinfo else [])
-                      if k.lower() == 'retry-after' or k.lower().startswith('x-ratelimit')}
-                _log('[%s] POST %s http=%s hdr=%s body=%s' %
-                     (m.name, self.path, code, rl, preview[:500]))
+                ra = rem = msg = ''
+                try:
+                    j = json.loads(preview)
+                    err = j.get('error') if isinstance(j.get('error'), dict) else {}
+                    ra = err.get('retry_after') or j.get('retry_after') or ''
+                    msg = (j.get('message') or err.get('message') or '')[:70]
+                except Exception:
+                    pass
+                if rinfo:
+                    ra = ra or rinfo.get('Retry-After', '')
+                    rem = rinfo.get('x-ratelimit-remaining-requests', '?')
+                _log('  ↳ %s [%s] retry=%ss rem-req=%s %s' % (code, m.name, ra, rem, msg))
             if code == 429:
                 n429 += 1
                 if n429 >= MAX_429_FAILOVER:
@@ -577,21 +604,20 @@ class H(http.server.BaseHTTPRequestHandler):
 
         if stream is None:
             if code is None:
-                # Tidak ada member yang bisa dicoba (semua cooldown).
-                # Kasih tau klien kapan boleh retry, jangan tembak upstream.
                 wait = max(1, int(min(m.cooldown_until for m in MEMBERS)
                                   - time.monotonic()) + 1)
+                _log('⚠ 503 semua member cooldown retry=%ds | %s' % (wait, _tally('429')))
                 return self._send_json(503, {
                     'error': {'message': 'semua member cooldown',
                               'reason': 'rate_limited', 'retry_after': wait}})
             if code == 429:
-                # Cap failover tercapai: masih ada member segar, tapi request
-                # ini berhenti biar tidak membakar pool. Beri retry_after.
                 wait = max(1, int(min(m.cooldown_until for m in MEMBERS)
                                   - time.monotonic()) + 1)
+                _log('⚠ 503 failover cap retry=%ds | %s' % (wait, _tally('429')))
                 return self._send_json(503, {
                     'error': {'message': 'rate limited (failover cap)',
                               'reason': 'rate_limited', 'retry_after': wait}})
+            _log('✗ %s semua member gagal | %s' % (code, _tally('err')))
             return self._send_json(503 if code == 401 else 599,
                                    {'error': {'message': 'semua member gagal '
                                               '(last http=%s)' % code}})
@@ -635,7 +661,6 @@ def _keepalive_loop():
                 horizon = KEEPALIVE_HORIZON if KEEPALIVE_HORIZON > 0 else tick + SKEW
                 if exp is None or exp.timestamp() - _now().timestamp() < horizon:
                     m.refresh_now()
-                    _log('[%s] keepalive refresh OK' % m.name)
             except Exception as e:
                 _log('[%s] keepalive gagal: %s' % (m.name, e))
                 m.cooldown_until = time.monotonic() + COOLDOWN_401
@@ -673,6 +698,11 @@ if __name__ == '__main__':
         threading.Thread(target=_keepalive_loop, daemon=True,
                          name='nous-proxy-keepalive').start()
     print('nous proxy: 127.0.0.1:%d -> %s' % (PORT, UP), flush=True)
-    print('members: %s' % ', '.join('%s(%s)' % (m.name, m.kind) for m in MEMBERS), flush=True)
-    print('keepalive: %s | log: %s' % ('on' if KEEPALIVE and not NO_REFRESH else 'off', LOG), flush=True)
+    print('members (%d): %s' % (len(MEMBERS), ', '.join(m.name for m in MEMBERS)), flush=True)
+    print('config: cooldown429=%ds cooldown401=%ds failover-cap=%d concurrent=%d'
+          % (COOLDOWN_429, COOLDOWN_401, MAX_429_FAILOVER, MAX_CONCURRENT), flush=True)
+    print('keepalive: %s | log: console%s'
+          % ('on' if KEEPALIVE and not NO_REFRESH else 'off',
+             ' + file (%s)' % LOG if WRITE_LOG_FILE else ' only'), flush=True)
+    print('--- live (✓ ok / ⚠ 429 / ✗ error) ---', flush=True)
     Server(('127.0.0.1', PORT), H).serve_forever()
