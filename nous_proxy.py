@@ -29,6 +29,11 @@ INCLUDE_MAIN = os.environ.get('INCLUDE_MAIN') == '1'
 BACKEND_MODE = 'readonly' if NO_REFRESH else os.environ.get('BACKEND_MODE', 'auto').strip().lower()
 COOLDOWN_429 = int(os.environ.get('COOLDOWN_429', '60'))
 COOLDOWN_401 = int(os.environ.get('COOLDOWN_401', '120'))
+# Batasi failover saat 429: satu request tidak boleh membakar seluruh pool.
+MAX_429_FAILOVER = int(os.environ.get('MAX_429_FAILOVER', '2'))
+# Batasi request paralel ke upstream (burst 3x200k token nabrak limit apa pun).
+MAX_CONCURRENT = int(os.environ.get('MAX_CONCURRENT', '2'))
+UP_SEM = threading.BoundedSemaphore(MAX_CONCURRENT)
 KEEPALIVE = os.environ.get('KEEPALIVE', '1') != '0'
 KEEPALIVE_HORIZON = int(os.environ.get('KEEPALIVE_HORIZON', '0'))
 SKEW = 120
@@ -356,10 +361,10 @@ def pick_member(exclude=()):
                 continue
             if time.monotonic() >= m.cooldown_until:
                 return m
-        cands = [m for m in MEMBERS if m.name not in exclude]
-        if not cands:
-            return None
-        return min(cands, key=lambda m: m.cooldown_until)
+        # Semua member masih cooldown: jangan paksa tembak upstream.
+        # Menembak akun yang lagi kena 429 cuma me-reset cooldown-nya dan
+        # bikin pool terjebak badai rate-limit. Biarkan cooldown habis dulu.
+        return None
 
 
 def sanitize(body, path):
@@ -400,11 +405,19 @@ def _client_ok(headers):
     return headers.get('Authorization', '') == 'Bearer ' + LOCAL_KEY
 
 
-def _cooldown(m, code, rinfo):
+def _cooldown(m, code, rinfo, body=''):
     if code == 429:
         wait = COOLDOWN_429
         try:
             ra = int(rinfo.get('Retry-After', ''))
+            wait = max(wait, min(ra, 3600))
+        except Exception:
+            pass
+        # Nous juga kirim retry_after di body JSON, bukan cuma header.
+        try:
+            j = json.loads(body)
+            err = j.get('error') if isinstance(j.get('error'), dict) else {}
+            ra = int(err.get('retry_after') or j.get('retry_after'))
             wait = max(wait, min(ra, 3600))
         except Exception:
             pass
@@ -473,6 +486,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_POST(self):
+        with UP_SEM:
+            self._do_post()
+
+    def _do_post(self):
         if not _client_ok(self.headers):
             return self._send_json(401, {'error': {'message': 'local key salah'}})
         ln = int(self.headers.get('Content-Length') or 0)
@@ -489,6 +506,7 @@ class H(http.server.BaseHTTPRequestHandler):
 
         tried = set()
         code = rinfo = stream = None
+        n429 = 0
         for _ in range(len(MEMBERS) + 1):
             m = pick_member(exclude=tried)
             if m is None:
@@ -531,18 +549,50 @@ class H(http.server.BaseHTTPRequestHandler):
                      (m.name, self.path, code, stripped, len(raw)))
                 break
             m.stats['fail'] += 1
-            if code in (401, 429):
-                _cooldown(m, code, rinfo)
+            preview = ''
             if stream is not None:
                 try:
-                    stream.read()
+                    preview = stream.read(2000).decode('utf-8', 'replace')
+                except Exception:
+                    pass
+                try:
+                    stream.close()
                 except Exception:
                     pass
                 stream = None
+            if code in (401, 429):
+                _cooldown(m, code, rinfo, preview)
+            if code in (401, 429, 503):
+                rl = {k: v for k, v in (rinfo.items() if rinfo else [])
+                      if k.lower() == 'retry-after' or k.lower().startswith('x-ratelimit')}
+                _log('[%s] POST %s http=%s hdr=%s body=%s' %
+                     (m.name, self.path, code, rl, preview[:500]))
+            if code == 429:
+                n429 += 1
+                if n429 >= MAX_429_FAILOVER:
+                    _log('[%s] cap failover 429 tercapai (%d) -> stop, sisa pool diamankan'
+                         % (m.name, n429))
+                    break
             _log('[%s] POST %s gagal http=%s -> failover' % (m.name, self.path, code))
 
         if stream is None:
-            return self._send_json(503 if code in (401, 429, None) else 599,
+            if code is None:
+                # Tidak ada member yang bisa dicoba (semua cooldown).
+                # Kasih tau klien kapan boleh retry, jangan tembak upstream.
+                wait = max(1, int(min(m.cooldown_until for m in MEMBERS)
+                                  - time.monotonic()) + 1)
+                return self._send_json(503, {
+                    'error': {'message': 'semua member cooldown',
+                              'reason': 'rate_limited', 'retry_after': wait}})
+            if code == 429:
+                # Cap failover tercapai: masih ada member segar, tapi request
+                # ini berhenti biar tidak membakar pool. Beri retry_after.
+                wait = max(1, int(min(m.cooldown_until for m in MEMBERS)
+                                  - time.monotonic()) + 1)
+                return self._send_json(503, {
+                    'error': {'message': 'rate limited (failover cap)',
+                              'reason': 'rate_limited', 'retry_after': wait}})
+            return self._send_json(503 if code == 401 else 599,
                                    {'error': {'message': 'semua member gagal '
                                               '(last http=%s)' % code}})
         self.send_response(code)
